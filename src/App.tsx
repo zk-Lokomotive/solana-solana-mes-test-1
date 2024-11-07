@@ -9,7 +9,7 @@ import { encoding, signSendWait } from '@wormhole-foundation/sdk';
 import type { UnsignedTransaction, SignAndSendSigner } from '@wormhole-foundation/sdk';
 import solana from '@wormhole-foundation/sdk/solana';
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom';
-import { Transaction } from '@solana/web3.js';
+import { Transaction, Connection, clusterApiUrl } from '@solana/web3.js';
 import { UniversalAddress } from "@wormhole-foundation/sdk";
 import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletConnectButton } from './components/WalletConnectButton';
@@ -29,6 +29,12 @@ function App() {
       if (!connected || !publicKey) {
         throw new Error('Wallet not connected');
       }
+
+      // Initialize connection
+      const connection = new Connection(
+        import.meta.env.VITE_SOLANA_RPC_URL || clusterApiUrl('devnet'),
+        'confirmed'
+      );
 
       const wh = await wormhole('Testnet', [solana], {
         chains: {
@@ -51,26 +57,40 @@ function App() {
         signAndSend: async (
           unsignedTxs: UnsignedTransaction<'Testnet', 'Solana'>[]
         ): Promise<string[]> => {
-          const transactions = unsignedTxs.map(tx => {
-            const solTx = new Transaction();
-            const instructions = (tx as any).instructions || [];
-            solTx.add(...instructions);
-            return solTx;
-          });
-          
+          const transactions = await Promise.all(
+            unsignedTxs.map(async (unsignedTx: any) => {
+              const transaction = new Transaction();
+              
+              const latestBlockhash = await connection.getLatestBlockhash();
+              transaction.recentBlockhash = latestBlockhash.blockhash;
+              transaction.feePayer = publicKey;
+
+              if (unsignedTx.instructions && unsignedTx.instructions.length > 0) {
+                transaction.add(...unsignedTx.instructions);
+              } else {
+                throw new Error('No instructions found in transaction');
+              }
+
+              return transaction;
+            })
+          );
+
           const signedTxs = await walletAdapter.signAllTransactions(transactions);
-          
-          return signedTxs.map(tx => {
-            const signatures = tx.signatures[0];
-            if (!signatures) throw new Error('No signature found');
-            return signatures.toString();
-          });
+
+          const signatures = await Promise.all(
+            signedTxs.map(async (tx) => {
+              const rawTransaction = tx.serialize();
+              return await connection.sendRawTransaction(rawTransaction);
+            })
+          );
+
+          return signatures;
         }
       };
 
       const destinationAddress = new UniversalAddress(
         walletAddress,
-        "hex"
+        "base58"
       );
 
       const publishTxs = coreBridge.publishMessage(
@@ -95,6 +115,7 @@ function App() {
 
       await wh.getVaa(whm, 'TokenBridge:Transfer', 60_000);
       return finalTxId;
+
     } catch (err) {
       console.error('Wormhole transfer error:', err);
       throw new Error(err instanceof Error ? err.message : 'Failed to send message');
