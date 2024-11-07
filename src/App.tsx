@@ -11,8 +11,11 @@ import solana from '@wormhole-foundation/sdk/solana';
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom';
 import { Transaction } from '@solana/web3.js';
 import { UniversalAddress } from "@wormhole-foundation/sdk";
+import { useWallet } from '@solana/wallet-adapter-react';
+import { WalletConnectButton } from './components/WalletConnectButton';
 
 function App() {
+  const { connected, publicKey } = useWallet();
   const [walletAddress, setWalletAddress] = useState('');
   const [messageHash, setMessageHash] = useState('');
   const [txHash, setTxHash] = useState<string | null>(null);
@@ -23,7 +26,10 @@ function App() {
     message: string
   ): Promise<string> => {
     try {
-      // Initialize Wormhole with Solana testnet
+      if (!connected || !publicKey) {
+        throw new Error('Wallet not connected');
+      }
+
       const wh = await wormhole('Testnet', [solana], {
         chains: {
           Solana: {
@@ -32,33 +38,21 @@ function App() {
         },
       });
 
-      // Get Solana chain context
       const chain = wh.getChain('Solana');
-      
-      // Initialize Phantom wallet adapter
       const walletAdapter = new PhantomWalletAdapter();
       await walletAdapter.connect();
 
-      if (!walletAdapter.publicKey) {
-        throw new Error('Wallet not connected');
-      }
-
-      // Get the core messaging bridge
       const coreBridge = await chain.getWormholeCore();
-
-      // Prepare the message payload
       const payload = encoding.bytes.encode(message);
       
-      // Create custom signer object that implements SignAndSendSigner
       const customSigner: SignAndSendSigner<'Testnet', 'Solana'> = {
         chain: () => 'Solana',
-        address: () => walletAdapter.publicKey!.toBase58(),
+        address: () => publicKey.toBase58(),
         signAndSend: async (
           unsignedTxs: UnsignedTransaction<'Testnet', 'Solana'>[]
         ): Promise<string[]> => {
           const transactions = unsignedTxs.map(tx => {
             const solTx = new Transaction();
-            // Handle instructions safely
             const instructions = (tx as any).instructions || [];
             solTx.add(...instructions);
             return solTx;
@@ -74,14 +68,11 @@ function App() {
         }
       };
 
-      // Create a SolanaAddress instance for the destination
-      const destinationPublicKey = walletAdapter.publicKey;
       const destinationAddress = new UniversalAddress(
-        destinationPublicKey.toBuffer(), 
-        "hex" 
+        walletAddress,
+        "hex"
       );
 
-      // Generate publish message transaction
       const publishTxs = coreBridge.publishMessage(
         destinationAddress,
         payload,
@@ -89,26 +80,20 @@ function App() {
         0
       );
 
-      // Sign and send the transaction
       const txids = await signSendWait(chain, publishTxs, customSigner);
-      
-      // Get the last transaction ID
       const finalTxId = txids[txids.length - 1]?.txid;
       
       if (!finalTxId) {
         throw new Error('Failed to get transaction ID');
       }
 
-      // Get the Wormhole message ID from the transaction
       const [whm] = await chain.parseTransaction(finalTxId);
       
       if (!whm) {
         throw new Error('Failed to parse Wormhole message');
       }
 
-      // Wait for the VAA
       await wh.getVaa(whm, 'TokenBridge:Transfer', 60_000);
-
       return finalTxId;
     } catch (err) {
       console.error('Wormhole transfer error:', err);
@@ -118,6 +103,12 @@ function App() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    
+    if (!connected) {
+      setError("Please connect your wallet first");
+      return;
+    }
+
     setIsLoading(true);
     setError(null);
     
@@ -134,7 +125,7 @@ function App() {
   };
 
   const isValidWallet = !walletAddress || isValidSolanaAddress(walletAddress);
-  const canSubmit = isValidSolanaAddress(walletAddress) && messageHash.length > 0 && !isLoading;
+  const canSubmit = connected && isValidSolanaAddress(walletAddress) && messageHash.length > 0 && !isLoading;
 
   return (
     <div className="min-h-screen bg-[#FEFFAF] flex items-center justify-center p-4">
@@ -145,6 +136,8 @@ function App() {
         </div>
 
         <form onSubmit={handleSubmit} className="mt-8 space-y-6 bg-white/80 backdrop-blur-sm p-6 rounded-xl shadow-xl">
+          <WalletConnectButton />
+          
           <WalletInput
             value={walletAddress}
             onChange={setWalletAddress}
