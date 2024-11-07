@@ -9,7 +9,8 @@ import { encoding, signSendWait } from '@wormhole-foundation/sdk';
 import type { UnsignedTransaction, SignAndSendSigner } from '@wormhole-foundation/sdk';
 import solana from '@wormhole-foundation/sdk/solana';
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom';
-import { Transaction, PublicKey } from '@solana/web3.js';
+import { Transaction } from '@solana/web3.js';
+import { UniversalAddress } from "@wormhole-foundation/sdk";
 
 function App() {
   const [walletAddress, setWalletAddress] = useState('');
@@ -73,8 +74,12 @@ function App() {
         }
       };
 
-      // Convert public key to appropriate format for destination address
-      const destinationAddress = new PublicKey(walletAddress).toBytes();
+      // Create a SolanaAddress instance for the destination
+      const destinationPublicKey = walletAdapter.publicKey;
+      const destinationAddress = new UniversalAddress(
+        destinationPublicKey.toBuffer(), 
+        "hex" 
+      );
 
       // Generate publish message transaction
       const publishTxs = coreBridge.publishMessage(
