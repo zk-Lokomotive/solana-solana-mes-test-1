@@ -9,8 +9,7 @@ import { encoding, signSendWait } from '@wormhole-foundation/sdk';
 import type { UnsignedTransaction, SignAndSendSigner } from '@wormhole-foundation/sdk';
 import solana from '@wormhole-foundation/sdk/solana';
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom';
-import { Transaction } from '@solana/web3.js';
-import { toChain } from '@wormhole-foundation/sdk/lib/src/utils/chains';
+import { Transaction, PublicKey } from '@solana/web3.js';
 
 function App() {
   const [walletAddress, setWalletAddress] = useState('');
@@ -51,7 +50,7 @@ function App() {
       
       // Create custom signer object that implements SignAndSendSigner
       const customSigner: SignAndSendSigner<'Testnet', 'Solana'> = {
-        chain: () => toChain('Solana'),
+        chain: () => 'Solana',
         address: () => walletAdapter.publicKey!.toBase58(),
         signAndSend: async (
           unsignedTxs: UnsignedTransaction<'Testnet', 'Solana'>[]
@@ -74,9 +73,12 @@ function App() {
         }
       };
 
+      // Convert public key to appropriate format for destination address
+      const destinationAddress = new PublicKey(walletAddress).toBytes();
+
       // Generate publish message transaction
       const publishTxs = coreBridge.publishMessage(
-        walletAdapter.publicKey.toBase58(),
+        destinationAddress,
         payload,
         0,
         0
