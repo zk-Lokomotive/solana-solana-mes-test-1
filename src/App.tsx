@@ -1,4 +1,3 @@
-
 import React, { useState } from 'react';
 import { Send } from 'lucide-react';
 import { WalletInput } from './components/WalletInput';
@@ -10,10 +9,29 @@ import { encoding, signSendWait } from '@wormhole-foundation/sdk';
 import type { UnsignedTransaction, SignAndSendSigner } from '@wormhole-foundation/sdk';
 import solana from '@wormhole-foundation/sdk/solana';
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom';
-import { Transaction, Connection } from '@solana/web3.js';
+import { 
+  Transaction, 
+  Connection, 
+  Commitment,
+  TransactionSignature,
+  // PublicKey
+} from '@solana/web3.js';
 import { UniversalAddress } from "@wormhole-foundation/sdk";
 import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletConnectButton } from './components/WalletConnectButton';
+
+// RPC URL & WH Contract Details
+const SOLANA_RPC_URL = 'https://api.devnet.solana.com';
+const COMMITMENT: Commitment = 'confirmed';
+// const WORMHOLE_BRIDGE_ADDRESS = 'worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth';
+
+// Devnet Program IDs
+const DEVNET_CONTRACTS = {
+  core: 'Bridge1p5gheXUvJ6jGWGeCsgPKgnE3YgdGKRVCMY9o', // Devnet Core Bridge
+  token_bridge: 'B6RHG3mfcckmrYN1UhmJzyS1XX3fZKbkeUcpJe9Sy3FE', // Devnet Token Bridge
+  nft_bridge: 'NFTWqJR8YnRVqPDvTJrYuLrQDitTG5AScqbeghi4zSA' // Devnet NFT Bridge
+} as const; 
+
 
 function App() {
   const { connected, publicKey } = useWallet();
@@ -23,45 +41,86 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Transaction retry ayarları
+  const TX_RETRY_COUNT = 5;
+  const TX_RETRY_DELAY = 2000;
+
+  // Confirmation helper
+  const confirmTransaction = async (
+    connection: Connection,
+    signature: TransactionSignature,
+  ): Promise<void> => {
+    const latestBlockhash = await connection.getLatestBlockhash();
+    await connection.confirmTransaction(
+      {
+        signature,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      },
+      COMMITMENT
+    );
+  };
+
   const sendMessageViaWormhole = async (message: string): Promise<string> => {
     try {
       if (!connected || !publicKey) {
         throw new Error('Wallet not connected');
       }
 
-      console.log('Initializing connection and wormhole...');
-      const connection = new Connection(
-        'https://api.devnet.solana.com',
-        {
-          commitment: 'confirmed',
-          wsEndpoint: 'wss://api.devnet.solana.com/',
-        }
-      );
-
-      const wh = await wormhole('Devnet', [solana], {
-        chains: {
-          Solana: {
-            rpc: 'https://api.devnet.solana.com',
-            key: undefined, // Add private key
-          },
-        },
-      });
-      const chain = wh.getChain('Solana');
-
-      console.log('Getting core bridge...');
-      const coreBridge = await chain.getWormholeCore();
-
-      // Bridge Configuration
-      if (!coreBridge) {
-        throw new Error('Failed to initialize Wormhole core bridge');
+      if (!isValidSolanaAddress(walletAddress)) {
+        throw new Error('Invalid destination address');
       }
+
+      console.log('Initializing connection and wormhole...');
+
+
+      const connection = new Connection(SOLANA_RPC_URL, {
+        commitment: COMMITMENT,
+        confirmTransactionInitialTimeout: 60000,
+        wsEndpoint: 'wss://api.devnet.solana.com/',
+      });
+      
+
+
+// Wormhole Initialization
+const wh = await wormhole('Devnet', [solana], {
+  chains: {
+    Solana: {
+      rpc: SOLANA_RPC_URL,
+      contracts: DEVNET_CONTRACTS,
+    },
+  },
+});
+
+
+const chain = wh.getChain('Solana');
+
+
+// Core bridge initialization with retry mechanism
+let coreBridge;
+let retryCount = 3;
+while (retryCount > 0) {
+  try {
+    coreBridge = await chain.getWormholeCore();
+    if (!coreBridge) {
+      throw new Error('Failed to initialize Wormhole core bridge');
+    }
+    break;
+  } catch (error) {
+    console.error(`Core bridge initialization attempt ${4 - retryCount} failed:`, error);
+    retryCount--;
+    if (retryCount === 0) {
+      throw new Error('Failed to connect to Wormhole bridge after multiple attempts');
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+}
+
 
 
       console.log('Preparing message payload...');
       const payload = encoding.bytes.encode(message);
 
-
-      // Signer Implementation
       const customSigner: SignAndSendSigner<'Devnet', 'Solana'> = {
         chain: () => 'Solana',
         address: () => publicKey.toBase58(),
@@ -76,38 +135,32 @@ function App() {
               
               const transaction = new Transaction();
               
-              // Get latest blockhash with retry
-
+              let retries = TX_RETRY_COUNT;
               let blockhash;
-              let retries = 3;
+              let lastValidBlockHeight;
+
               while (retries > 0) {
                 try {
-                  const { blockhash: newBlockhash, lastValidBlockHeight } = 
-                    await connection.getLatestBlockhash('finalized');
-                  blockhash = newBlockhash;
-                  transaction.lastValidBlockHeight = lastValidBlockHeight;
+                  const latestBlockhash = await connection.getLatestBlockhash(COMMITMENT);
+                  blockhash = latestBlockhash.blockhash;
+                  lastValidBlockHeight = latestBlockhash.lastValidBlockHeight;
                   break;
                 } catch (error) {
-                  console.error('Failed to get blockhash, retrying...');
+                  console.error('Failed to get blockhash, retrying...', error);
                   retries--;
                   if (retries === 0) throw error;
-                  await new Promise(resolve => setTimeout(resolve, 1000));
+                  await new Promise(resolve => setTimeout(resolve, TX_RETRY_DELAY));
                 }
               }
 
-              transaction.recentBlockhash = blockhash;
+              transaction.recentBlockhash = blockhash!;
+              transaction.lastValidBlockHeight = lastValidBlockHeight!;
               transaction.feePayer = publicKey;
 
-
-              // Instructions'ları ekle
-              if (unsignedTx.instructions) {
-                console.log('Found instructions:', unsignedTx.instructions);
-                if (unsignedTx.instructions.length === 0) {
-                  throw new Error('Empty instructions array in transaction');
-                }
+              if (unsignedTx.instructions?.length) {
+                console.log(`Adding ${unsignedTx.instructions.length} instructions`);
                 transaction.add(...unsignedTx.instructions);
               } else {
-                console.error('Transaction data:', unsignedTx);
                 throw new Error('No instructions found in transaction');
               }
 
@@ -118,51 +171,42 @@ function App() {
           console.log('Signing transactions...');
           const walletAdapter = new PhantomWalletAdapter();
           await walletAdapter.connect();
+          
           const signedTxs = await walletAdapter.signAllTransactions(transactions);
-
 
           console.log('Sending transactions...');
           const signatures = await Promise.all(
             signedTxs.map(async (tx) => {
               const rawTransaction = tx.serialize();
+              let signature: string | undefined;
               
-              let retries = 5; // Increased retries
+              let retries = TX_RETRY_COUNT;
               while (retries > 0) {
                 try {
-                  const signature = await connection.sendRawTransaction(rawTransaction, {
+                  signature = await connection.sendRawTransaction(rawTransaction, {
                     skipPreflight: true,
-                    maxRetries: 5,
-                    preflightCommitment: 'confirmed'
+                    maxRetries: TX_RETRY_COUNT,
+                    preflightCommitment: COMMITMENT,
                   });
 
                   console.log('Waiting for confirmation...');
-                  const confirmation = await connection.confirmTransaction({
-                    signature,
-                    blockhash: tx.recentBlockhash!,
-                    lastValidBlockHeight: tx.lastValidBlockHeight!,
-                  }, {
-                    commitment: 'confirmed',
-                    maxRetries: 5
-                  });
-
-                  if (confirmation.value.err) {
-                    throw new Error(`Transaction confirmation failed: ${confirmation.value.err}`);
-                  }
-
+                  await confirmTransaction(connection, signature);
+                  
                   console.log('Transaction confirmed:', signature);
                   return signature;
                 } catch (error) {
                   console.error(`Transaction attempt failed, ${retries} retries left:`, error);
                   retries--;
                   if (retries === 0) throw error;
-                  await new Promise(resolve => setTimeout(resolve, 2000));
+                  await new Promise(resolve => setTimeout(resolve, TX_RETRY_DELAY));
                 }
               }
+              
               throw new Error('Transaction failed after all retries');
             })
           );
 
-          return signatures;
+          return signatures.filter((sig): sig is string => sig !== undefined);
         }
       };
 
@@ -172,13 +216,22 @@ function App() {
         "base58"
       );
 
-      console.log('Creating publish message transaction...');
-      const publishTxs = await coreBridge.publishMessage(
-        destinationAddress,
-        payload,
-        0,  // nonce
-        1   // consistency level: confirmed
-      );
+      console.log('Create publish message...');
+      if (!coreBridge) {
+        throw new Error('coreBridge not defined');
+      }
+      let publishTxs;
+      try {
+        publishTxs = await coreBridge.publishMessage(
+          destinationAddress,
+          payload,
+          0,  // nonce
+          1   
+        );
+      } catch (error) {
+        console.error('Publish message Error:', error);
+        throw error;
+      }
 
       console.log('Sending and waiting for transaction...');
       const txids = await signSendWait(chain, publishTxs, customSigner);
@@ -193,7 +246,6 @@ function App() {
 
       console.log('Parsing transaction...');
       const [whm] = await chain.parseTransaction(finalTxId);
-      
       
       if (!whm) {
         throw new Error('Failed to parse Wormhole message');
@@ -214,20 +266,22 @@ function App() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     
-    if (!connected) {
-      setError("Please connect your wallet first");
-      return;
-    }
-
-    if (!walletAddress || !messageHash) {
-      setError("Please fill in all fields");
-      return;
-    }
-
-    setIsLoading(true);
-    setError(null);
-    
     try {
+      if (!connected) {
+        throw new Error("Please connect your wallet first");
+      }
+
+      if (!walletAddress || !messageHash) {
+        throw new Error("Please fill in all fields");
+      }
+
+      if (!isValidSolanaAddress(walletAddress)) {
+        throw new Error("Invalid destination address");
+      }
+
+      setIsLoading(true);
+      setError(null);
+      
       const hash = await sendMessageViaWormhole(messageHash);
       setTxHash(hash);
       console.log('Message sent successfully! Transaction hash:', hash);
@@ -241,7 +295,10 @@ function App() {
   };
 
   const isValidWallet = !walletAddress || isValidSolanaAddress(walletAddress);
-  const canSubmit = connected && isValidSolanaAddress(walletAddress) && messageHash.length > 0 && !isLoading;
+  const canSubmit = connected && 
+                   isValidSolanaAddress(walletAddress) && 
+                   messageHash.length > 0 && 
+                   !isLoading;
 
   return (
     <div className="min-h-screen bg-[#FEFFAF] flex items-center justify-center p-4">
