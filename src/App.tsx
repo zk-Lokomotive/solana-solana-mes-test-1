@@ -10,7 +10,7 @@ import { encoding, signSendWait } from '@wormhole-foundation/sdk';
 import type { UnsignedTransaction, SignAndSendSigner } from '@wormhole-foundation/sdk';
 import solana from '@wormhole-foundation/sdk/solana';
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom';
-import { Transaction, Connection, clusterApiUrl } from '@solana/web3.js';
+import { Transaction, Connection } from '@solana/web3.js';
 import { UniversalAddress } from "@wormhole-foundation/sdk";
 import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletConnectButton } from './components/WalletConnectButton';
@@ -31,19 +31,37 @@ function App() {
 
       console.log('Initializing connection and wormhole...');
       const connection = new Connection(
-        clusterApiUrl('devnet'),
-        'confirmed'
+        'https://api.devnet.solana.com',
+        {
+          commitment: 'confirmed',
+          wsEndpoint: 'wss://api.devnet.solana.com/',
+        }
       );
 
-      const wh = await wormhole('Devnet', [solana]);
+      const wh = await wormhole('Devnet', [solana], {
+        chains: {
+          Solana: {
+            rpc: 'https://api.devnet.solana.com',
+            key: undefined, // Add private key
+          },
+        },
+      });
       const chain = wh.getChain('Solana');
 
       console.log('Getting core bridge...');
       const coreBridge = await chain.getWormholeCore();
 
+      // Bridge Configuration
+      if (!coreBridge) {
+        throw new Error('Failed to initialize Wormhole core bridge');
+      }
+
+
       console.log('Preparing message payload...');
       const payload = encoding.bytes.encode(message);
 
+
+      // Signer Implementation
       const customSigner: SignAndSendSigner<'Devnet', 'Solana'> = {
         chain: () => 'Solana',
         address: () => publicKey.toBase58(),
@@ -58,29 +76,39 @@ function App() {
               
               const transaction = new Transaction();
               
-              const { blockhash, lastValidBlockHeight } = 
-                await connection.getLatestBlockhash('finalized');
-              
+              // Get latest blockhash with retry
+
+              let blockhash;
+              let retries = 3;
+              while (retries > 0) {
+                try {
+                  const { blockhash: newBlockhash, lastValidBlockHeight } = 
+                    await connection.getLatestBlockhash('finalized');
+                  blockhash = newBlockhash;
+                  transaction.lastValidBlockHeight = lastValidBlockHeight;
+                  break;
+                } catch (error) {
+                  console.error('Failed to get blockhash, retrying...');
+                  retries--;
+                  if (retries === 0) throw error;
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+              }
+
               transaction.recentBlockhash = blockhash;
-              transaction.lastValidBlockHeight = lastValidBlockHeight;
               transaction.feePayer = publicKey;
+
 
               // Instructions'ları ekle
               if (unsignedTx.instructions) {
                 console.log('Found instructions:', unsignedTx.instructions);
+                if (unsignedTx.instructions.length === 0) {
+                  throw new Error('Empty instructions array in transaction');
+                }
                 transaction.add(...unsignedTx.instructions);
               } else {
-                console.log('Trying to extract instructions from tx data...');
-                const txInstructions = (unsignedTx as any).data?.instructions || 
-                                     (unsignedTx as any).message?.instructions ||
-                                     unsignedTx.instructions;
-                
-                if (!txInstructions || txInstructions.length === 0) {
-                  console.error('Transaction data:', unsignedTx);
-                  throw new Error('No instructions found in transaction');
-                }
-                
-                transaction.add(...txInstructions);
+                console.error('Transaction data:', unsignedTx);
+                throw new Error('No instructions found in transaction');
               }
 
               return transaction;
@@ -92,26 +120,34 @@ function App() {
           await walletAdapter.connect();
           const signedTxs = await walletAdapter.signAllTransactions(transactions);
 
+
           console.log('Sending transactions...');
           const signatures = await Promise.all(
             signedTxs.map(async (tx) => {
               const rawTransaction = tx.serialize();
               
-              let retries = 3;
+              let retries = 5; // Increased retries
               while (retries > 0) {
                 try {
                   const signature = await connection.sendRawTransaction(rawTransaction, {
                     skipPreflight: true,
-                    maxRetries: 3,
+                    maxRetries: 5,
                     preflightCommitment: 'confirmed'
                   });
 
                   console.log('Waiting for confirmation...');
-                  await connection.confirmTransaction({
+                  const confirmation = await connection.confirmTransaction({
                     signature,
                     blockhash: tx.recentBlockhash!,
                     lastValidBlockHeight: tx.lastValidBlockHeight!,
-                  }, 'confirmed');
+                  }, {
+                    commitment: 'confirmed',
+                    maxRetries: 5
+                  });
+
+                  if (confirmation.value.err) {
+                    throw new Error(`Transaction confirmation failed: ${confirmation.value.err}`);
+                  }
 
                   console.log('Transaction confirmed:', signature);
                   return signature;
@@ -140,8 +176,8 @@ function App() {
       const publishTxs = await coreBridge.publishMessage(
         destinationAddress,
         payload,
-        0,
-        1
+        0,  // nonce
+        1   // consistency level: confirmed
       );
 
       console.log('Sending and waiting for transaction...');
@@ -157,6 +193,7 @@ function App() {
 
       console.log('Parsing transaction...');
       const [whm] = await chain.parseTransaction(finalTxId);
+      
       
       if (!whm) {
         throw new Error('Failed to parse Wormhole message');
