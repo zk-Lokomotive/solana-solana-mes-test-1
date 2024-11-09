@@ -1,3 +1,4 @@
+
 import React, { useState } from 'react';
 import { Send } from 'lucide-react';
 import { WalletInput } from './components/WalletInput';
@@ -13,10 +14,6 @@ import { Transaction, Connection, clusterApiUrl } from '@solana/web3.js';
 import { UniversalAddress } from "@wormhole-foundation/sdk";
 import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletConnectButton } from './components/WalletConnectButton';
-// import { 
-//   VAA_PAYLOAD_TYPES 
-// } from '@wormhole-foundation/sdk';
-
 
 function App() {
   const { connected, publicKey } = useWallet();
@@ -26,72 +23,81 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const sendMessageViaWormhole = async (
-    message: string
-  ): Promise<string> => {
+  const sendMessageViaWormhole = async (message: string): Promise<string> => {
     try {
       if (!connected || !publicKey) {
         throw new Error('Wallet not connected');
       }
 
-      // Devnet bağlantısı
+      console.log('Initializing connection and wormhole...');
       const connection = new Connection(
         clusterApiUrl('devnet'),
         'confirmed'
       );
 
-      // Wormhole devnet yapılandırması
-      const wh = await wormhole('Devnet', [solana], {
-        chains: {
-          Solana: {
-            rpc: 'https://api.devnet.solana.com',
-          },
-        },
-      });
-
+      const wh = await wormhole('Devnet', [solana]);
       const chain = wh.getChain('Solana');
-      const walletAdapter = new PhantomWalletAdapter();
-      await walletAdapter.connect();
 
+      console.log('Getting core bridge...');
       const coreBridge = await chain.getWormholeCore();
+
+      console.log('Preparing message payload...');
       const payload = encoding.bytes.encode(message);
-      
+
       const customSigner: SignAndSendSigner<'Devnet', 'Solana'> = {
         chain: () => 'Solana',
         address: () => publicKey.toBase58(),
         signAndSend: async (
           unsignedTxs: UnsignedTransaction<'Devnet', 'Solana'>[]
         ): Promise<string[]> => {
+          console.log('Preparing transactions...');
+          
           const transactions = await Promise.all(
             unsignedTxs.map(async (unsignedTx: any) => {
+              console.log('Processing transaction:', unsignedTx);
+              
               const transaction = new Transaction();
               
-              // Devnet için blockhash al
-              const latestBlockhash = await connection.getLatestBlockhash('confirmed');
-              transaction.recentBlockhash = latestBlockhash.blockhash;
+              const { blockhash, lastValidBlockHeight } = 
+                await connection.getLatestBlockhash('finalized');
+              
+              transaction.recentBlockhash = blockhash;
+              transaction.lastValidBlockHeight = lastValidBlockHeight;
               transaction.feePayer = publicKey;
 
-              // Instructions kontrolü ve ekleme
-              if (unsignedTx.instructions && unsignedTx.instructions.length > 0) {
+              // Instructions'ları ekle
+              if (unsignedTx.instructions) {
+                console.log('Found instructions:', unsignedTx.instructions);
                 transaction.add(...unsignedTx.instructions);
               } else {
-                console.error('Transaction data:', unsignedTx);
-                throw new Error('No instructions found in transaction');
+                console.log('Trying to extract instructions from tx data...');
+                const txInstructions = (unsignedTx as any).data?.instructions || 
+                                     (unsignedTx as any).message?.instructions ||
+                                     unsignedTx.instructions;
+                
+                if (!txInstructions || txInstructions.length === 0) {
+                  console.error('Transaction data:', unsignedTx);
+                  throw new Error('No instructions found in transaction');
+                }
+                
+                transaction.add(...txInstructions);
               }
 
               return transaction;
             })
           );
 
+          console.log('Signing transactions...');
+          const walletAdapter = new PhantomWalletAdapter();
+          await walletAdapter.connect();
           const signedTxs = await walletAdapter.signAllTransactions(transactions);
 
-          // Devnet'e transaction gönderimi
+          console.log('Sending transactions...');
           const signatures = await Promise.all(
             signedTxs.map(async (tx) => {
               const rawTransaction = tx.serialize();
               
-              // Devnet için retry logic ve confirmation
-              let retries = 5;
+              let retries = 3;
               while (retries > 0) {
                 try {
                   const signature = await connection.sendRawTransaction(rawTransaction, {
@@ -100,22 +106,20 @@ function App() {
                     preflightCommitment: 'confirmed'
                   });
 
-                  // Transaction confirmation bekle
-                  const confirmation = await connection.confirmTransaction({
+                  console.log('Waiting for confirmation...');
+                  await connection.confirmTransaction({
                     signature,
                     blockhash: tx.recentBlockhash!,
-                    lastValidBlockHeight: (await connection.getLatestBlockhash()).lastValidBlockHeight,
+                    lastValidBlockHeight: tx.lastValidBlockHeight!,
                   }, 'confirmed');
 
-                  if (confirmation.value.err) {
-                    throw new Error(`Transaction failed: ${confirmation.value.err.toString()}`);
-                  }
-
+                  console.log('Transaction confirmed:', signature);
                   return signature;
                 } catch (error) {
+                  console.error(`Transaction attempt failed, ${retries} retries left:`, error);
                   retries--;
                   if (retries === 0) throw error;
-                  await new Promise(resolve => setTimeout(resolve, 1000));
+                  await new Promise(resolve => setTimeout(resolve, 2000));
                 }
               }
               throw new Error('Transaction failed after all retries');
@@ -126,45 +130,47 @@ function App() {
         }
       };
 
-      // Destination adresini oluştur
+      console.log('Creating destination address...');
       const destinationAddress = new UniversalAddress(
         walletAddress,
         "base58"
       );
 
-      // Devnet için message publishing
-      const publishTxs = coreBridge.publishMessage(
+      console.log('Creating publish message transaction...');
+      const publishTxs = await coreBridge.publishMessage(
         destinationAddress,
         payload,
-        0,   // nonce
-        1    // finality: confirmed
+        0,
+        1
       );
 
-      // Transaction'ı gönder ve bekle
-      console.log('Sending transaction...');
+      console.log('Sending and waiting for transaction...');
       const txids = await signSendWait(chain, publishTxs, customSigner);
+      console.log('Transaction IDs:', txids);
+
       const finalTxId = txids[txids.length - 1]?.txid;
-      
       if (!finalTxId) {
         throw new Error('Failed to get transaction ID');
       }
 
-      console.log('Transaction sent:', finalTxId);
+      console.log('Final transaction ID:', finalTxId);
 
-      // Message'ı parse et
+      console.log('Parsing transaction...');
       const [whm] = await chain.parseTransaction(finalTxId);
       
       if (!whm) {
         throw new Error('Failed to parse Wormhole message');
       }
 
-      // VAA'yı bekle
-      await wh.getVaa(whm, 'TokenBridge:Transfer', 60_000);      
+      console.log('Waiting for VAA...');
+      await wh.getVaa(whm, 'Uint8Array', 60_000);
+      
+      console.log('Transaction completed successfully');
       return finalTxId;
 
     } catch (err) {
-      console.error('Wormhole transfer error:', err);
-      throw new Error(err instanceof Error ? err.message : 'Failed to send message');
+      console.error('Detailed error:', err);
+      throw err;
     }
   };
 
