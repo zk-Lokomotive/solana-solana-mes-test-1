@@ -30,16 +30,17 @@ function App() {
         throw new Error('Wallet not connected');
       }
 
-      // Initialize connection
+      // Devnet bağlantısı
       const connection = new Connection(
-        import.meta.env.VITE_SOLANA_RPC_URL || clusterApiUrl('devnet'),
+        clusterApiUrl('devnet'),
         'confirmed'
       );
 
-      const wh = await wormhole('Testnet', [solana], {
+      // Wormhole devnet yapılandırması
+      const wh = await wormhole('Devnet', [solana], {
         chains: {
           Solana: {
-            rpc: import.meta.env.VITE_SOLANA_RPC_URL || 'https://api.devnet.solana.com',
+            rpc: 'https://api.devnet.solana.com',
           },
         },
       });
@@ -51,23 +52,26 @@ function App() {
       const coreBridge = await chain.getWormholeCore();
       const payload = encoding.bytes.encode(message);
       
-      const customSigner: SignAndSendSigner<'Testnet', 'Solana'> = {
+      const customSigner: SignAndSendSigner<'Devnet', 'Solana'> = {
         chain: () => 'Solana',
         address: () => publicKey.toBase58(),
         signAndSend: async (
-          unsignedTxs: UnsignedTransaction<'Testnet', 'Solana'>[]
+          unsignedTxs: UnsignedTransaction<'Devnet', 'Solana'>[]
         ): Promise<string[]> => {
           const transactions = await Promise.all(
             unsignedTxs.map(async (unsignedTx: any) => {
               const transaction = new Transaction();
               
-              const latestBlockhash = await connection.getLatestBlockhash();
+              // Devnet için blockhash al
+              const latestBlockhash = await connection.getLatestBlockhash('confirmed');
               transaction.recentBlockhash = latestBlockhash.blockhash;
               transaction.feePayer = publicKey;
 
+              // Instructions kontrolü ve ekleme
               if (unsignedTx.instructions && unsignedTx.instructions.length > 0) {
                 transaction.add(...unsignedTx.instructions);
               } else {
+                console.error('Transaction data:', unsignedTx);
                 throw new Error('No instructions found in transaction');
               }
 
@@ -77,10 +81,40 @@ function App() {
 
           const signedTxs = await walletAdapter.signAllTransactions(transactions);
 
+          // Devnet'e transaction gönderimi
           const signatures = await Promise.all(
             signedTxs.map(async (tx) => {
               const rawTransaction = tx.serialize();
-              return await connection.sendRawTransaction(rawTransaction);
+              
+              // Devnet için retry logic ve confirmation
+              let retries = 5;
+              while (retries > 0) {
+                try {
+                  const signature = await connection.sendRawTransaction(rawTransaction, {
+                    skipPreflight: true,
+                    maxRetries: 3,
+                    preflightCommitment: 'confirmed'
+                  });
+
+                  // Transaction confirmation bekle
+                  const confirmation = await connection.confirmTransaction({
+                    signature,
+                    blockhash: tx.recentBlockhash!,
+                    lastValidBlockHeight: (await connection.getLatestBlockhash()).lastValidBlockHeight,
+                  }, 'confirmed');
+
+                  if (confirmation.value.err) {
+                    throw new Error(`Transaction failed: ${confirmation.value.err.toString()}`);
+                  }
+
+                  return signature;
+                } catch (error) {
+                  retries--;
+                  if (retries === 0) throw error;
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+              }
+              throw new Error('Transaction failed after all retries');
             })
           );
 
@@ -88,18 +122,22 @@ function App() {
         }
       };
 
+      // Destination adresini oluştur
       const destinationAddress = new UniversalAddress(
         walletAddress,
         "base58"
       );
 
+      // Devnet için message publishing
       const publishTxs = coreBridge.publishMessage(
         destinationAddress,
         payload,
-        0,
-        0
+        0,   // nonce
+        1    // finality: confirmed
       );
 
+      // Transaction'ı gönder ve bekle
+      console.log('Sending transaction...');
       const txids = await signSendWait(chain, publishTxs, customSigner);
       const finalTxId = txids[txids.length - 1]?.txid;
       
@@ -107,13 +145,17 @@ function App() {
         throw new Error('Failed to get transaction ID');
       }
 
+      console.log('Transaction sent:', finalTxId);
+
+      // Message'ı parse et
       const [whm] = await chain.parseTransaction(finalTxId);
       
       if (!whm) {
         throw new Error('Failed to parse Wormhole message');
       }
 
-      await wh.getVaa(whm, 'TokenBridge:Transfer', 60_000);
+      // VAA'yı bekle
+      await wh.getVaa(whm, 'Core:EmitMessage', 60_000);
       return finalTxId;
 
     } catch (err) {
@@ -130,12 +172,18 @@ function App() {
       return;
     }
 
+    if (!walletAddress || !messageHash) {
+      setError("Please fill in all fields");
+      return;
+    }
+
     setIsLoading(true);
     setError(null);
     
     try {
       const hash = await sendMessageViaWormhole(messageHash);
       setTxHash(hash);
+      console.log('Message sent successfully! Transaction hash:', hash);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Transaction failed';
       setError(errorMessage);
@@ -153,7 +201,7 @@ function App() {
       <div className="w-full max-w-md space-y-8">
         <div className="text-center">
           <h1 className="text-3xl font-bold text-gray-900">Wormhole Bridge</h1>
-          <p className="mt-2 text-gray-600">Send messages via Solana testnet</p>
+          <p className="mt-2 text-gray-600">Send messages via Solana devnet</p>
         </div>
 
         <form onSubmit={handleSubmit} className="mt-8 space-y-6 bg-white/80 backdrop-blur-sm p-6 rounded-xl shadow-xl">
