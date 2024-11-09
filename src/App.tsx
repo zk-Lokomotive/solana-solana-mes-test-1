@@ -13,6 +13,10 @@ import { Transaction, Connection, clusterApiUrl } from '@solana/web3.js';
 import { UniversalAddress } from "@wormhole-foundation/sdk";
 import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletConnectButton } from './components/WalletConnectButton';
+// import { 
+//   VAA_PAYLOAD_TYPES 
+// } from '@wormhole-foundation/sdk';
+
 
 function App() {
   const { connected, publicKey } = useWallet();
@@ -155,7 +159,7 @@ function App() {
       }
 
       // VAA'yı bekle
-      await wh.getVaa(whm, 'Core:EmitMessage', 60_000);
+      await wh.getVaa(whm, 'TokenBridge:Transfer', 60_000);      
       return finalTxId;
 
     } catch (err) {
